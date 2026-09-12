@@ -48,6 +48,12 @@
 #define IS_PSF1_MAGIC(m) (m[0] == 0x36 && m[1] == 0x04)
 #define IS_PSF2_MAGIC(m) (m[0] == 0x72 && m[1] == 0xb5 && m[2] == 0x4a && m[3] == 0x86)
 
+#define PSF1_FLAG_512 0x1
+#define PSF1_FLAG_TAB 0x2
+#define PSF1_FLAG_SEQ 0x4
+
+#define PSF2_FLAG_TAB 0x1
+
 #define FREAD(f, to, size, err, ...)                                                               \
 	if (_fread(f, to, size) < (size)) {                                                        \
 		log_error(err);                                                                    \
@@ -56,18 +62,24 @@
 	}
 
 typedef struct {
-	uint32_t cap;
-	uint16_t data[];
-} *unicode_table_t;
+	uint16_t glyph;
+	uint32_t code;
+} unicode_entry_t;
 
 typedef struct {
-	uint32_t has_unicode_table;
+	uint32_t cap;
+	uint32_t size;
+	unicode_entry_t *data;
+} unicode_table_t;
+
+typedef struct {
 	uint32_t glyphs;
 	uint32_t step;
 	uint32_t height;
 	uint32_t width;
 	uint32_t scale;
 	unicode_table_t unicode_table;
+	bool has_unicode_table;
 	uint8_t data[];
 } psf_font_t;
 
@@ -80,16 +92,19 @@ static fseek_t _fseek;
 static fread_t _fread;
 static fclose_t _fclose;
 
-static unicode_table_t unicode_table_parse(void *, uint8_t);
-static uint16_t unicode_table_get(unicode_table_t, uint32_t);
-static void unicode_table_exit(unicode_table_t);
+static uint8_t unicode_table_init(unicode_table_t *);
+static uint8_t psf1_unicode_table_parse(unicode_table_t *, void *);
+static uint8_t psf2_unicode_table_parse(unicode_table_t *, void *);
+static uint16_t unicode_table_get(unicode_table_t *, uint32_t);
+static void unicode_table_exit(unicode_table_t *);
 
 static int kmscon_font_psf_init(struct kmscon_font *out, const char *name,
 				unsigned int query_height)
 {
 	unsigned char magic[4];
 	psf_font_t *font = NULL;
-	uint32_t has_unicode_table, glyphs, step, height, width;
+	uint32_t flags, glyphs, step, height, width;
+	bool has_unicode_table;
 
 	_fseek = (fseek_t)fseek;
 	_fread = (fread_t)fread_;
@@ -117,18 +132,22 @@ static int kmscon_font_psf_init(struct kmscon_font *out, const char *name,
 	}
 
 	if (IS_PSF1_MAGIC(magic)) {
-		glyphs = (magic[2] & 0x01) ? 512 : 256;
-		has_unicode_table = magic[2] & 0b110;
+		flags = magic[2];
+		glyphs = (flags & PSF1_FLAG_512) ? 512 : 256;
+		has_unicode_table = flags & (PSF1_FLAG_TAB | PSF1_FLAG_SEQ);
+
 		width = 8;
 		height = magic[3];
 		step = height;
 	} else if (IS_PSF2_MAGIC(magic)) {
 		_fseek(font_file, 12, SEEK_SET);
-		FREAD(font_file, &has_unicode_table, 4, "failed read flags");
+		FREAD(font_file, &flags, 4, "failed read flags");
 		FREAD(font_file, &glyphs, 4, "failed read glyphs");
 		FREAD(font_file, &step, 4, "failed read step");
 		FREAD(font_file, &height, 4, "failed read height");
 		FREAD(font_file, &width, 4, "failed read width");
+
+		has_unicode_table = flags & PSF2_FLAG_TAB;
 	} else {
 		log_error("file isn't psf1 or psf2");
 		goto err_file;
@@ -147,12 +166,18 @@ static int kmscon_font_psf_init(struct kmscon_font *out, const char *name,
 
 	FREAD(font_file, font->data, glyphs * step, "file is too short to store all font glyphs");
 
-	if (has_unicode_table)
-		if (!(font->unicode_table = unicode_table_parse(font_file, IS_PSF2_MAGIC(magic)))) {
-			log_error("failed parse unicode table");
+	if (has_unicode_table) {
+		if (unicode_table_init(&font->unicode_table)) {
+			log_error("failed init unicode table");
 			goto err_file;
 		}
 
+		if ((IS_PSF2_MAGIC(magic) ? psf2_unicode_table_parse : psf1_unicode_table_parse)(
+			    &font->unicode_table, font_file)) {
+			log_error("failed parse unicode table");
+			goto err_file;
+		}
+	}
 	_fclose(font_file);
 
 	font->scale = (query_height + (height / 2)) / height;
@@ -164,7 +189,7 @@ static int kmscon_font_psf_init(struct kmscon_font *out, const char *name,
 	font->height = height * font->scale;
 	out->increase_step = height;
 
-	log_notice("using font: %s %dx%d, scale %d glyphs %d", name, width, height, font->scale,
+	log_notice("using font: %s %dx%d, scale %d, glyphs %d", name, width, height, font->scale,
 		   font->glyphs);
 
 	return 0;
@@ -178,7 +203,7 @@ static void kmscon_font_psf_destroy(struct kmscon_font *kfont)
 {
 	psf_font_t *font = kfont->data;
 	log_debug("unloading psf font");
-	unicode_table_exit(font->unicode_table);
+	unicode_table_exit(&font->unicode_table);
 	free(font);
 }
 
@@ -248,7 +273,7 @@ static bool kmscon_font_psf_has_glyph(struct kmscon_font *kfont, struct kmscon_f
 	psf_font_t *font = kfont->data;
 
 	if (font->has_unicode_table)
-		ch = unicode_table_get(font->unicode_table, ch);
+		ch = unicode_table_get(&font->unicode_table, ch);
 
 	return (ch == FONT_FULL_BLOCK || ch == FONT_VBAR || ch < font->glyphs);
 }
@@ -264,7 +289,7 @@ static struct kmscon_glyph *kmscon_font_psf_render(struct kmscon_font *kfont,
 		ch = 179;
 
 	if (font->has_unicode_table)
-		ch = unicode_table_get(font->unicode_table, ch);
+		ch = unicode_table_get(&font->unicode_table, ch);
 
 	if (ch >= font->glyphs)
 		return new_glyph(kfont, attr, '?');
@@ -272,26 +297,75 @@ static struct kmscon_glyph *kmscon_font_psf_render(struct kmscon_font *kfont,
 	return new_glyph(kfont, attr, ch);
 }
 
-static unicode_table_t unicode_table_init()
+uint8_t unicode_table_init(unicode_table_t *self)
 {
-	unicode_table_t ut = malloc(sizeof(*ut) + 256 * sizeof(uint16_t));
-	if (!ut)
-		return NULL;
-	ut->cap = 256;
-	return ut;
+	self->cap = 512;
+	self->size = 0;
+	self->data = malloc(sizeof(unicode_entry_t) * self->cap);
+
+	if (!self->data)
+		return 1;
+
+	return 0;
 }
 
 static uint8_t unicode_table_add(unicode_table_t *self, uint32_t code, uint16_t ch)
 {
-	if (code >= (*self)->cap)
-		*self = realloc(*self, (sizeof(**self) + ((*self)->cap = code + 128) * 2));
+	self->data[self->size] = (unicode_entry_t){.glyph = ch, .code = code};
 
-	if (!*self) {
+	if ((++self->size) >= self->cap)
+		self->data = realloc(self->data, sizeof(unicode_entry_t) * (self->cap *= 2));
+
+	if (!self->data) {
 		log_error("failed realloc unicode table");
 		return 1;
 	}
 
-	(*self)->data[code] = ch;
+	return 0;
+}
+
+static int cmp_unicode_entry(const void *__1, const void *__2)
+{
+	const unicode_entry_t *_1 = __1;
+	const unicode_entry_t *_2 = __2;
+
+	if (_1->code < _2->code)
+		return -1;
+	if (_1->code > _2->code)
+		return 1;
+	return 0;
+}
+
+#define UCODE_SIZE 1024
+uint8_t psf1_unicode_table_parse(unicode_table_t *self, void *file)
+{
+	uint8_t ucode[UCODE_SIZE];
+	uint32_t ucode_idx = 0;
+	uint32_t ucode_size;
+	uint16_t ch = 0;
+
+	union {
+		uint16_t val;
+		uint8_t map[2];
+	} code;
+
+	while ((ucode_size = _fread(file, &ucode, UCODE_SIZE))) {
+		while (ucode_idx < ucode_size) {
+			code.map[0] = ucode[ucode_idx++];
+			code.map[1] = ucode[ucode_idx++];
+
+			if (code.map[0] == 0xff && (code.map[1] == 0xfe || code.map[1] == 0xff)) {
+				ch++;
+				continue;
+			}
+
+			if (unicode_table_add(self, code.val, ch))
+				return 1;
+		}
+		ucode_idx = 0;
+	}
+
+	qsort(self->data, self->size, sizeof(unicode_entry_t), cmp_unicode_entry);
 	return 0;
 }
 
@@ -300,80 +374,67 @@ static uint8_t utf8_len(uint8_t c)
 	return (c & 0x80) == 0 ? 0 : (c & 0xE0) == 0xC0 ? 1 : (c & 0xF0) == 0xE0 ? 2 : 3;
 }
 
-unicode_table_t unicode_table_parse(void *file, uint8_t psf)
+uint8_t psf2_unicode_table_parse(unicode_table_t *self, void *file)
 {
-#define UCODE_SIZE 1024
 	uint8_t ucode[UCODE_SIZE];
 	uint32_t ucode_idx = 0;
 	uint32_t ucode_size;
 	uint16_t ch = 0;
 
 	union {
-		uint16_t psf1;
-		uint32_t psf2;
+		uint32_t val;
 		uint8_t map[4];
 	} code;
 
-	unicode_table_t unicode_table = unicode_table_init();
-	if (!unicode_table) {
-		log_error("failed allocate memory for unicode table");
-		return 0;
-	}
-
 	while ((ucode_size = _fread(file, &ucode, UCODE_SIZE))) {
-		if (psf)
-			while (ucode_idx < ucode_size) {
-				code.psf2 = 0;
-				switch ((code.map[0] = ucode[ucode_idx++])) {
-				case 0xfe:
-				case 0xff:
-					ch++;
-					break;
-				default:
-					uint8_t i = utf8_len(code.map[0]);
-					if (i) {
-						code.psf2 =
-							((uint32_t)(code.map[0] & (0xFF >> (2 + i)))
-							 << i * 6);
+		while (ucode_idx < ucode_size) {
+			code.val = 0;
+			switch ((code.map[0] = ucode[ucode_idx++])) {
+			case 0xfe:
+			case 0xff:
+				ch++;
+				break;
+			default:
+				uint8_t i = utf8_len(code.map[0]);
+				if (i) {
+					code.val = ((uint32_t)(code.map[0] & (0xFF >> (2 + i)))
+						    << i * 6);
 
-						for (; i; i--)
-							code.psf2 |=
-								((uint32_t)(ucode[ucode_idx++] &
-									    0x3f)
-								 << (i - 1) * 6);
-					}
+					for (; i; i--)
+						code.val |= ((uint32_t)(ucode[ucode_idx++] & 0x3f)
+							     << (i - 1) * 6);
+				}
 
-					if (unicode_table_add(&unicode_table, code.psf2, ch))
-						return NULL;
-				}
+				if (unicode_table_add(self, code.val, ch))
+					return 1;
 			}
-		else
-			while (ucode_idx < ucode_size) {
-				code.map[0] = ucode[ucode_idx++];
-				code.map[1] = ucode[ucode_idx++];
-				switch ((code.psf1)) {
-				case 0xfffe:
-				case 0xffff:
-					ch++;
-					break;
-				default:
-					if (unicode_table_add(&unicode_table, code.psf1, ch))
-						return NULL;
-				}
-			}
+		}
 		ucode_idx = 0;
 	}
-	return unicode_table;
+
+	qsort(self->data, self->size, sizeof(unicode_entry_t), cmp_unicode_entry);
+	return 0;
 }
 
-static uint16_t unicode_table_get(unicode_table_t self, uint32_t code)
+static uint16_t unicode_table_get(unicode_table_t *self, uint32_t code)
 {
-	return self->data[code];
+	uint32_t l = 0, r = self->size;
+	while (l < r) {
+		uint32_t m = (l + r) / 2;
+
+		if (self->data[m].code == code)
+			return self->data[m].glyph;
+		if (self->data[m].code < code)
+			l = m + 1;
+		else
+			r = m;
+	}
+	return 0xffff;
 }
 
-static void unicode_table_exit(unicode_table_t self)
+static void unicode_table_exit(unicode_table_t *self)
 {
-	free(self);
+	free(self->data);
 }
 
 static int fread_(void *src, void *dst, unsigned size)

@@ -185,8 +185,8 @@ static int kmscon_font_psf_init(struct kmscon_font *out, const char *name,
 		font->scale = 1;
 	out->data = font;
 
-	font->width = width * font->scale;
-	font->height = height * font->scale;
+	out->width = width * font->scale;
+	out->height = height * font->scale;
 	out->increase_step = height;
 
 	log_notice("using font: %s %dx%d, scale %d, glyphs %d", name, width, height, font->scale,
